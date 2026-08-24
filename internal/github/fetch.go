@@ -4,11 +4,13 @@ import (
 	stdctx "context"
 	"errors"
 	"fmt"
+	"io"
 	"net"
 	"net/url"
 	"os"
 	"regexp"
 	"strings"
+	"time"
 	"unicode/utf8"
 
 	gh "github.com/google/go-github/v84/github"
@@ -84,7 +86,7 @@ func blobURL(info *PRInfo, path string, line, endLine int) string {
 func FetchPR(ctx stdctx.Context, client Client, ref PRRef) (*PRInfo, error) {
 	pr, err := client.GetPR(ctx, ref.Owner, ref.Repo, ref.Number)
 	if err != nil {
-		return nil, ghAPIError("github.pr_fetch_failed", fmt.Sprintf("fetching PR %s/%s#%d", ref.Owner, ref.Repo, ref.Number), err)
+		return nil, ghFetchError(fmt.Sprintf("fetching PR %s/%s#%d", ref.Owner, ref.Repo, ref.Number), err)
 	}
 	if pr.Head == nil || pr.Base == nil {
 		return nil, &clierr.CLIError{
@@ -110,7 +112,7 @@ func FetchPR(ctx stdctx.Context, client Client, ref PRRef) (*PRInfo, error) {
 	for {
 		files, resp, lerr := client.ListFiles(ctx, ref.Owner, ref.Repo, ref.Number, opts)
 		if lerr != nil {
-			return nil, ghAPIError("github.pr_fetch_failed", "listing PR files", lerr)
+			return nil, ghFetchError("listing PR files", lerr)
 		}
 		for _, f := range files {
 			if name := f.GetFilename(); name != "" {
@@ -464,20 +466,29 @@ func fetchError(stage string, err error) error {
 	}
 }
 
+func ghFetchError(stage string, err error) error {
+	return mapGitHubAPIError("github.pr_fetch_failed", stage, err, true)
+}
+
 // ghAPIError classifies a GitHub API failure into a typed CLIError by a PROVEN
-// signal: the go-github *ErrorResponse status (401/403/404/5xx) or a net error
-// (DNS/refused/timeout). Anything unrecognized keeps the caller's fallback code
-// (github.pr_fetch_failed) so a real bug is never mislabeled retryable. The
-// message is redacted so a 401 body can't leak a token fragment.
+// signal: the go-github *ErrorResponse status (401/403/404/5xx), a net error
+// (DNS/refused/timeout), or a truncated HTTP body (io.EOF / unexpected EOF).
+// Anything unrecognized keeps the caller's fallback code so a real bug is never
+// mislabeled retryable. The message is redacted so a 401 body can't leak a
+// token fragment. Write-path 404s keep fallback; PR-fetch 404s use ghFetchError.
 func ghAPIError(fallback, stage string, err error) error {
+	return mapGitHubAPIError(fallback, stage, err, false)
+}
+
+func mapGitHubAPIError(fallback, stage string, err error, prNotFoundOn404 bool) error {
 	msg := config.RedactString(fmt.Sprintf("%s: %v", stage, err))
 
 	// Rate-limit errors arrive as dedicated types that do NOT embed *gh.ErrorResponse,
-	// so errors.As below would miss them; match them first. Reads are idempotent →
-	// SafeRetry (mirrors mapWriteError in publish.go).
+	// so errors.As below would miss them; match them first. GET-like calls are
+	// idempotent → SafeRetry.
 	var rle *gh.RateLimitError
 	if errors.As(err, &rle) {
-		return &clierr.CLIError{
+		ce := &clierr.CLIError{
 			Code:      "github.rate_limited",
 			Message:   "GitHub rate limit exceeded",
 			Hint:      "wait for the rate limit to reset, then re-run",
@@ -485,10 +496,14 @@ func ghAPIError(fallback, stage string, err error) error {
 			Retry:     true,
 			SafeRetry: true,
 		}
+		if secs := int(time.Until(rle.Rate.Reset.Time).Seconds()); secs > 0 {
+			ce.Details = map[string]any{"retry_after_seconds": secs}
+		}
+		return ce
 	}
 	var arle *gh.AbuseRateLimitError
 	if errors.As(err, &arle) {
-		return &clierr.CLIError{
+		ce := &clierr.CLIError{
 			Code:      "github.rate_limited",
 			Message:   "GitHub secondary (abuse) rate limit exceeded",
 			Hint:      "wait before retrying",
@@ -496,6 +511,12 @@ func ghAPIError(fallback, stage string, err error) error {
 			Retry:     true,
 			SafeRetry: true,
 		}
+		if arle.RetryAfter != nil {
+			if secs := int(arle.RetryAfter.Seconds()); secs > 0 {
+				ce.Details = map[string]any{"retry_after_seconds": secs}
+			}
+		}
+		return ce
 	}
 
 	var er *gh.ErrorResponse
@@ -509,12 +530,15 @@ func ghAPIError(fallback, stage string, err error) error {
 				Exit:    1,
 			}
 		case status == 404:
-			return &clierr.CLIError{
-				Code:    "github.pr_not_found",
-				Message: msg,
-				Hint:    "check the PR exists and the token has access",
-				Exit:    1,
+			if prNotFoundOn404 {
+				return &clierr.CLIError{
+					Code:    "github.pr_not_found",
+					Message: msg,
+					Hint:    "check the PR exists and the token has access",
+					Exit:    1,
+				}
 			}
+			return &clierr.CLIError{Code: fallback, Message: msg, Exit: 1}
 		case status == 429:
 			return &clierr.CLIError{
 				Code:      "github.rate_limited",
@@ -538,19 +562,28 @@ func ghAPIError(fallback, stage string, err error) error {
 
 	var netErr net.Error
 	if errors.As(err, &netErr) {
-		return &clierr.CLIError{
-			Code:      "github.unavailable",
-			Message:   msg,
-			Hint:      "cannot reach GitHub — check your network and retry",
-			Exit:      1,
-			Retry:     true,
-			SafeRetry: true,
-		}
+		return githubUnavailable(msg)
+	}
+	// GitHub often drops idle HTTP/2 connections as a bare unexpected EOF, which
+	// is not itself a net.Error when the url.Error wrapper is stripped.
+	if errors.Is(err, io.EOF) || errors.Is(err, io.ErrUnexpectedEOF) {
+		return githubUnavailable(msg)
 	}
 
 	return &clierr.CLIError{
 		Code:    fallback,
 		Message: msg,
 		Exit:    1,
+	}
+}
+
+func githubUnavailable(msg string) error {
+	return &clierr.CLIError{
+		Code:      "github.unavailable",
+		Message:   msg,
+		Hint:      "cannot reach GitHub — check your network and retry",
+		Exit:      1,
+		Retry:     true,
+		SafeRetry: true,
 	}
 }

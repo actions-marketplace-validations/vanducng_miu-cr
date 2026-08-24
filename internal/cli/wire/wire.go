@@ -901,7 +901,12 @@ func publishReviewWithDiffs(ctx stdctx.Context, client mgithub.Client, info *mgi
 	if req.Mode == "checks" {
 		return publishChecks(ctx, client, info, res, diffs, prResult, req, ew)
 	}
-	existing, err := mgithub.ExistingFingerprints(ctx, client, info)
+	var existing map[string]string
+	err := retryTransient(ctx, maxGitHubAttempts, func() error {
+		var e error
+		existing, e = mgithub.ExistingFingerprints(ctx, client, info)
+		return e
+	})
 	if err != nil {
 		return err
 	}
@@ -1420,5 +1425,10 @@ func retryTransient(ctx stdctx.Context, maxAttempts int, fn func() error) error 
 
 func isRetryableErr(err error) bool {
 	var ce *cli.CLIError
-	return errors.As(err, &ce) && ce.Retry
+	if !errors.As(err, &ce) || !ce.Retry {
+		return false
+	}
+	// Rate-limit Retry is for the host/user to wait out the window, not the
+	// 0.5-8s in-process blip loop.
+	return ce.Code != "github.rate_limited"
 }
