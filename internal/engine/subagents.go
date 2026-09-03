@@ -11,6 +11,7 @@ import (
 	"github.com/vanducng/miu-cr/internal/config"
 	enginectx "github.com/vanducng/miu-cr/internal/engine/context"
 	"github.com/vanducng/miu-cr/internal/engine/diff"
+	"github.com/vanducng/miu-cr/internal/engine/tools/symbolcontext"
 )
 
 const (
@@ -26,6 +27,7 @@ type reviewSharedContext struct {
 	projectContext  string
 	relatedContext  string
 	rev             string
+	index           *symbolcontext.Index
 	trace           *ReviewTrace
 }
 
@@ -89,6 +91,7 @@ func (e *Engine) reviewOnce(ctx stdctx.Context, req Request, text string, shared
 		ProviderRetry:    req.ProviderRetry,
 		Tools:            req.Tools,
 		SymbolContext:    req.SymbolContext,
+		Index:            shared.index,
 		RepoDir:          req.RepoDir,
 		Rev:              shared.rev,
 		Runner:           e.Runner,
@@ -132,13 +135,13 @@ func planSubagents(cfg SubagentConfig, selected []diff.Diff) []subagentPlan {
 			continue
 		}
 		for _, f := range files {
-			assigned[f.NewPath] = true
+			assigned[f.ReviewPath()] = true
 		}
 		plans = append(plans, subagentPlan{name: spec.Name, operatorPrompt: spec.OperatorPrompt, files: files})
 	}
 	var rest []diff.Diff
 	for _, f := range selected {
-		if !assigned[f.NewPath] {
+		if !assigned[f.ReviewPath()] {
 			rest = append(rest, f)
 		}
 	}

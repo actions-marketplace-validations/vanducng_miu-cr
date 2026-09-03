@@ -3,7 +3,9 @@ package wire
 import (
 	stdctx "context"
 	"errors"
+	"io"
 	"net/http"
+	"net/url"
 	"os"
 	"path/filepath"
 	"strings"
@@ -32,7 +34,8 @@ type fakeGitHub struct {
 	createIssueN  int
 	editN         int
 
-	headSHA          string                  // re-fetched head SHA returned by GetPR (defaults to "headsha")
+	headSHA          string // re-fetched head SHA returned by GetPR (defaults to "headsha")
+	conflicted       bool
 	reviews          []*gh.PullRequestReview // existing reviews returned by ListReviews
 	reviewThreads    []mgithub.ReviewThread
 	lastReviewed     *gh.PullRequestReviewRequest // last CreateReview request, for Event assertions
@@ -40,6 +43,7 @@ type fakeGitHub struct {
 	checkRunN        int
 	createReviewErr  error // injected CreateReview failure (e.g. fork 403)
 	issueListCtxErrs []error
+	listReviewErrs   []error // FIFO injected ListReviewComments failures
 }
 
 func (f *fakeGitHub) GetPR(stdctx.Context, string, string, int) (*gh.PullRequest, error) {
@@ -52,6 +56,7 @@ func (f *fakeGitHub) GetPR(stdctx.Context, string, string, int) (*gh.PullRequest
 		Head:              &gh.PullRequestBranch{SHA: gh.Ptr(sha), Repo: repo},
 		Base:              &gh.PullRequestBranch{SHA: gh.Ptr("basesha"), Ref: gh.Ptr("main"), Repo: repo},
 		AuthorAssociation: gh.Ptr("MEMBER"),
+		Mergeable:         gh.Ptr(!f.conflicted),
 	}, nil
 }
 func (f *fakeGitHub) ListFiles(stdctx.Context, string, string, int, *gh.ListOptions) ([]*gh.CommitFile, *gh.Response, error) {
@@ -84,6 +89,11 @@ func (f *fakeGitHub) CreateReview(_ stdctx.Context, _, _ string, _ int, r *gh.Pu
 
 func (f *fakeGitHub) ListReviewComments(stdctx.Context, string, string, int, *gh.PullRequestListCommentsOptions) ([]*gh.PullRequestComment, *gh.Response, error) {
 	f.order = append(f.order, "list_review")
+	if len(f.listReviewErrs) > 0 {
+		err := f.listReviewErrs[0]
+		f.listReviewErrs = f.listReviewErrs[1:]
+		return nil, nil, err
+	}
 	return f.reviewComments, &gh.Response{}, nil
 }
 func (f *fakeGitHub) ReviewThreads(stdctx.Context, string, string, int) ([]mgithub.ReviewThread, error) {
@@ -136,6 +146,10 @@ func (f *fakeGitHub) UpdateCheckRun(stdctx.Context, string, string, int64, gh.Up
 func (f *fakeGitHub) ListCheckRunsForRef(stdctx.Context, string, string, string, *gh.ListCheckRunsOptions) (*gh.ListCheckRunsResults, *gh.Response, error) {
 	f.order = append(f.order, "list_check")
 	return &gh.ListCheckRunsResults{}, &gh.Response{}, nil
+}
+func (f *fakeGitHub) GetCombinedStatus(stdctx.Context, string, string, string, *gh.ListOptions) (*gh.CombinedStatus, *gh.Response, error) {
+	f.order = append(f.order, "combined_status")
+	return &gh.CombinedStatus{}, &gh.Response{}, nil
 }
 
 func TestAckPRReviewStartedReactsAndPostsRunningSummary(t *testing.T) {
@@ -193,18 +207,18 @@ func TestAckPRReviewStartedKeepsExistingSummaryOnRerun(t *testing.T) {
 
 	ackPRReviewStarted(stdctx.Background(), fake, info)
 
-	if got := strings.Join(fake.order, ","); got != "react_issue,list_issue" {
+	if got := strings.Join(fake.order, ","); got != "react_issue,list_issue,edit_issue" {
 		t.Fatalf("ack order = %s", got)
 	}
-	if fake.createIssueN != 0 || fake.editN != 0 {
-		t.Fatalf("existing summary must not be replaced by running state: create=%d edit=%d", fake.createIssueN, fake.editN)
+	if fake.createIssueN != 0 || fake.editN != 1 {
+		t.Fatalf("existing summary must be edited with running status: create=%d edit=%d", fake.createIssueN, fake.editN)
 	}
 	if len(fake.issueComments) != 1 {
 		t.Fatalf("want one summary, got %d", len(fake.issueComments))
 	}
 	body := fake.issueComments[0].GetBody()
-	if !strings.Contains(body, "Review passed") || strings.Contains(body, "Review running") {
-		t.Fatalf("existing result should stay visible during re-review:\n%s", body)
+	if !strings.Contains(body, "Review passed") || !strings.Contains(body, "Reviewing commit") || strings.Contains(body, "**Result:** Review running") {
+		t.Fatalf("existing result should stay visible with review status:\n%s", body)
 	}
 }
 
@@ -350,6 +364,46 @@ func TestPublishReviewWireFlow(t *testing.T) {
 	}
 	if got := fake.issueComments[0].GetBody(); !strings.Contains(got, "Review attempts: 2") {
 		t.Fatalf("re-run summary must advance to Review attempts: 2:\n%s", got)
+	}
+}
+
+func TestPublishReviewRetriesTransientListComments(t *testing.T) {
+	defer func(b time.Duration) { retryBackoffBase = b }(retryBackoffBase)
+	retryBackoffBase = time.Millisecond
+
+	runner := gitcmd.New()
+	dir, base, head := setupRepo(t, runner)
+	fake := &fakeGitHub{
+		listReviewErrs: []error{
+			&url.Error{
+				Op:  "Get",
+				URL: "https://api.github.com/repos/o/r/pulls/7/comments?per_page=100",
+				Err: io.ErrUnexpectedEOF,
+			},
+		},
+	}
+	info := &mgithub.PRInfo{Owner: "o", Repo: "r", Number: 7, HeadSHA: head, BaseSHA: base, BaseBranch: "main", ReviewCount: 1}
+	res := engine.ReviewResult{
+		Findings: []engine.Finding{
+			{File: "foo.go", Line: 4, Severity: "high", Category: "bug", Rationale: "boom", QuotedCode: "func B() {}"},
+		},
+		Stats: map[string]any{"truncation_level": "full", "files_reviewed": float64(1)},
+	}
+	pr := &cli.PRResult{SummaryAction: "none"}
+	if err := publishReview(stdctx.Background(), fake, runner, dir, info, res, pr, cli.PRReviewRequest{Gate: "high"}, nil, embedWriter{}, nil, nil, testReuseKey); err != nil {
+		t.Fatalf("publishReview: %v", err)
+	}
+	if pr.PostedInline != 1 {
+		t.Fatalf("want 1 inline posted after retry, got %d", pr.PostedInline)
+	}
+	nList := 0
+	for _, step := range fake.order {
+		if step == "list_review" {
+			nList++
+		}
+	}
+	if nList < 2 {
+		t.Fatalf("transient list-comments EOF must retry, list_review count=%d order=%v", nList, fake.order)
 	}
 }
 
@@ -858,6 +912,28 @@ func TestPublishReviewApprovalClean(t *testing.T) {
 	}
 }
 
+func TestPublishReviewConflictBlocksApprovalAndUpdatesSummary(t *testing.T) {
+	runner := gitcmd.New()
+	dir, base, head := setupRepo(t, runner)
+	fake := &fakeGitHub{headSHA: head, conflicted: true}
+	info := &mgithub.PRInfo{Owner: "o", Repo: "r", Number: 7, HeadSHA: head, BaseSHA: base, BaseBranch: "main", AuthorAssociation: "MEMBER"}
+	pr := &cli.PRResult{SummaryAction: "none"}
+	req := cli.PRReviewRequest{Gate: "high", Approval: config.ApprovalPolicy{Mode: "clean"}}
+
+	if err := publishReview(stdctx.Background(), fake, runner, dir, info, cleanReviewResult(), pr, req, nil, embedWriter{}, nil, nil, ""); err != nil {
+		t.Fatalf("publishReview: %v", err)
+	}
+	if pr.ApproveAction != "commented" || pr.ApproveReason != "merge_conflict" {
+		t.Fatalf("conflict must block approval, got action=%q reason=%q", pr.ApproveAction, pr.ApproveReason)
+	}
+	if fake.lastReviewed != nil && fake.lastReviewed.GetEvent() == "APPROVE" {
+		t.Fatal("conflicted PR must not receive an approval")
+	}
+	if len(fake.issueComments) != 1 || !strings.Contains(fake.issueComments[0].GetBody(), "Resolve the merge conflicts") {
+		t.Fatalf("final summary must tell the developer how to unblock approval: %+v", fake.issueComments)
+	}
+}
+
 func TestPublishReviewApprovalThreshold(t *testing.T) {
 	runner := gitcmd.New()
 	dir, base, head := setupRepo(t, runner)
@@ -1073,5 +1149,14 @@ func TestRetryTransient(t *testing.T) {
 	})
 	if err == nil || calls != 1 {
 		t.Fatalf("non-retryable error must not retry: err=%v calls=%d", err, calls)
+	}
+	// github.rate_limited is Retry=true for host/user wait-out, not the blip loop.
+	calls = 0
+	err = retryTransient(stdctx.Background(), 3, func() error {
+		calls++
+		return &cli.CLIError{Code: "github.rate_limited", Retry: true}
+	})
+	if err == nil || calls != 1 {
+		t.Fatalf("rate-limited error must not short-retry: err=%v calls=%d", err, calls)
 	}
 }

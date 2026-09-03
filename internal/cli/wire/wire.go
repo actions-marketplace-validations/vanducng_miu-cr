@@ -251,6 +251,7 @@ func (engineReviewer) Review(ctx stdctx.Context, req cli.ReviewRequest) (cli.Rev
 		Provider:        string(creds.Kind),
 		Model:           creds.Model,
 		Quota:           gate,
+		AnchorRecovery:  cfg.Review.AnchorRecoveryOn(),
 
 		Rules:            loadRules(req.RepoDir, true),
 		RulesFork:        false,
@@ -316,6 +317,20 @@ func (prReviewer) GateFailed(findings []cli.ReviewFinding, gate string) bool {
 	return engine.GateFailed(toEngineFindings(findings), gate)
 }
 
+// applyRequestConfigOverrides folds request-level review overrides (the host
+// sets them per-repo from HostReview; the standalone CLI path leaves them
+// zero) into the loaded machine config, so the single source (cfg.Review)
+// stays consistent for BOTH the cache-reuse fingerprint and everything
+// downstream (resolved creds, engine request).
+func applyRequestConfigOverrides(cfg *config.Config, req cli.PRReviewRequest) {
+	if strings.TrimSpace(req.Thinking) != "" {
+		cfg.Review.Thinking = req.Thinking
+	}
+	if req.AnchorRecovery != nil {
+		cfg.Review.AnchorRecovery = req.AnchorRecovery
+	}
+}
+
 // wantConversation gates the opt-in PR-conversation fetch: requested AND not a
 // fork. Untrusted participant text gains no injection channel on fork PRs,
 // mirroring fork-dropped repo rules.
@@ -357,13 +372,7 @@ func (prReviewer) ReviewPR(ctx stdctx.Context, req cli.PRReviewRequest) (cli.Rev
 	if lerr != nil {
 		slog.Warn("config load failed, using built-in defaults: " + config.RedactString(lerr.Error()))
 	}
-	// A request-level thinking override (the host sets it per-repo from HostReview;
-	// cfg.Review.Thinking is only populated on the standalone CLI path) must flow to
-	// BOTH the resolved creds and the cache-reuse fingerprint — set it on cfg so the
-	// single source (cfg.Review.Thinking) stays consistent everywhere downstream.
-	if strings.TrimSpace(req.Thinking) != "" {
-		cfg.Review.Thinking = req.Thinking
-	}
+	applyRequestConfigOverrides(&cfg, req)
 	hist, closeHist := openHistoryStore(ctx, cfg, req.NoSave)
 	if closeHist != nil {
 		defer closeHist()
@@ -500,6 +509,7 @@ func (prReviewer) ReviewPR(ctx stdctx.Context, req cli.PRReviewRequest) (cli.Rev
 		Number:          info.Number,
 		Post:            req.Post,
 		PatchRepair:     req.PatchRepair,
+		AnchorRecovery:  cfg.Review.AnchorRecoveryOn(),
 
 		Rules:            loaded,
 		RulesFork:        info.IsFork,
@@ -655,6 +665,7 @@ type reviewReuseConfigShape struct {
 	ProviderAuthEnvValueFingerprint string
 	ReviewTemperature               *float64
 	ReviewThinking                  string
+	ReviewAnchorRecovery            *bool
 	CategoryURLs                    map[string]string
 	Env                             reviewReuseEnvShape
 	RequestSecretSet                reviewReuseRequestSecretShape
@@ -731,6 +742,7 @@ func newReviewReuseShape(req cli.PRReviewRequest, cfg config.Config, providerNam
 			ProviderAuthEnvValueFingerprint: secretReuseFingerprint(os.Getenv(provider.AuthEnv)),
 			ReviewTemperature:               cfg.Review.Temperature,
 			ReviewThinking:                  cfg.Review.Thinking,
+			ReviewAnchorRecovery:            cfg.Review.AnchorRecovery,
 			CategoryURLs:                    cfg.Review.CategoryURLs,
 			Env:                             reviewReuseEnvShapeFromProcess(),
 			RequestSecretSet: reviewReuseRequestSecretShape{
@@ -842,15 +854,15 @@ func ackPRReviewStarted(ctx stdctx.Context, client mgithub.Client, info *mgithub
 			"repo", info.Owner+"/"+info.Repo, "pr", info.Number, "head_sha", shortSHA(info.HeadSHA),
 			"reaction", "eyes")
 	}
-	action, url, err := mgithub.CreateSummaryCommentIfMissing(ctx, client, info, mgithub.RenderRunningSummary(info, cli.Version()))
+	action, url, err := mgithub.UpsertSummaryStatus(ctx, client, info, mgithub.RenderReviewingSummaryStatus(info), mgithub.RenderRunningSummary(info, cli.Version()))
 	if err != nil {
-		slog.Warn("review: running summary create failed",
+		slog.Warn("review: running summary status failed",
 			"repo", info.Owner+"/"+info.Repo, "pr", info.Number, "head_sha", shortSHA(info.HeadSHA),
 			"error", config.RedactString(err.Error()))
 		return
 	}
 	if action == mgithub.UpsertNone {
-		slog.Info("review: existing summary preserved while new review runs",
+		slog.Info("review: running summary status unchanged",
 			"repo", info.Owner+"/"+info.Repo, "pr", info.Number, "head_sha", shortSHA(info.HeadSHA),
 			"summary_action", string(action), "summary_url", url)
 		return
@@ -889,7 +901,12 @@ func publishReviewWithDiffs(ctx stdctx.Context, client mgithub.Client, info *mgi
 	if req.Mode == "checks" {
 		return publishChecks(ctx, client, info, res, diffs, prResult, req, ew)
 	}
-	existing, err := mgithub.ExistingFingerprints(ctx, client, info)
+	var existing map[string]string
+	err := retryTransient(ctx, maxGitHubAttempts, func() error {
+		var e error
+		existing, e = mgithub.ExistingFingerprints(ctx, client, info)
+		return e
+	})
 	if err != nil {
 		return err
 	}
@@ -956,6 +973,7 @@ func publishReviewWithDiffs(ctx stdctx.Context, client mgithub.Client, info *mgi
 	// renders in lifecycle mode on the PR path.
 	now := time.Now()
 	ledger := mgithub.MergeLedger(info.PriorLedger, publishFindings, info.HeadSHA, diffPathSet(diffs), now)
+	approvalReason := ""
 
 	// renderSummary builds the summary body for a given omitted set. info.ReviewCount
 	// is already this run's number (FetchPR did the +1); the body's runs token seeds
@@ -977,6 +995,7 @@ func publishReviewWithDiffs(ctx stdctx.Context, client mgithub.Client, info *mgi
 			Format:              req.Format,
 			SuppressWalkthrough: req.SuppressWalkthrough,
 			FileChangeSummary:   req.FileChangeSummary,
+			ApprovalReason:      approvalReason,
 		})
 	}
 
@@ -1000,6 +1019,7 @@ func publishReviewWithDiffs(ctx stdctx.Context, client mgithub.Client, info *mgi
 	if err != nil {
 		return err
 	}
+	approvalReason = pr.Reason
 	prResult.Mode = "review"
 	prResult.FallbackAnnotations = pr.Fallback
 	// Fork-PR 403 fallback fired on inline: findings went to ::error:: annotations. The
@@ -1185,6 +1205,7 @@ func (a agentAdapter) Review(ctx stdctx.Context, rc engine.AgentContext) (engine
 		ProviderRetry:    rc.ProviderRetry,
 		Tools:            rc.Tools,
 		SymbolContext:    rc.SymbolContext,
+		Index:            rc.Index, // lockstep: forgetting this makes every tool call rebuild the repo scan
 		RepoDir:          rc.RepoDir,
 		Rev:              rc.Rev,
 		Runner:           rc.Runner,
@@ -1200,6 +1221,20 @@ func (a agentAdapter) RepairPatch(ctx stdctx.Context, rr engine.RepairRequest) (
 	return a.inner.RepairPatch(ctx, agent.RepairRequest{
 		Span:          rr.Span,
 		Rationale:     rr.Rationale,
+		Category:      rr.Category,
+		Severity:      rr.Severity,
+		ProviderRetry: rr.ProviderRetry,
+	})
+}
+
+// RelocateQuote forwards the engine's anchor-recovery request to the concrete
+// agent — lockstep: a missed forward silently no-ops recovery for the real agent.
+func (a agentAdapter) RelocateQuote(ctx stdctx.Context, rr engine.RelocateRequest) (string, engine.Usage, error) {
+	return a.inner.RelocateQuote(ctx, agent.RelocateRequest{
+		File:          rr.File,
+		Rationale:     rr.Rationale,
+		QuotedCode:    rr.QuotedCode,
+		Excerpt:       rr.Excerpt,
 		Category:      rr.Category,
 		Severity:      rr.Severity,
 		ProviderRetry: rr.ProviderRetry,
@@ -1301,6 +1336,16 @@ func (l *lazyAgent) RepairPatch(ctx stdctx.Context, rr engine.RepairRequest) (st
 	return a.RepairPatch(ctx, rr)
 }
 
+// RelocateQuote reuses the memoized agent (mirroring Review) — lockstep with the
+// engine.Agent interface.
+func (l *lazyAgent) RelocateQuote(ctx stdctx.Context, rr engine.RelocateRequest) (string, engine.Usage, error) {
+	a, err := l.resolve(ctx)
+	if err != nil {
+		return "", engine.Usage{}, err
+	}
+	return a.RelocateQuote(ctx, rr)
+}
+
 func modeFor(req cli.ReviewRequest) diff.Mode {
 	switch {
 	case req.Commit != "":
@@ -1380,5 +1425,10 @@ func retryTransient(ctx stdctx.Context, maxAttempts int, fn func() error) error 
 
 func isRetryableErr(err error) bool {
 	var ce *cli.CLIError
-	return errors.As(err, &ce) && ce.Retry
+	if !errors.As(err, &ce) || !ce.Retry {
+		return false
+	}
+	// Rate-limit Retry is for the host/user to wait out the window, not the
+	// 0.5-8s in-process blip loop.
+	return ce.Code != "github.rate_limited"
 }

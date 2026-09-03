@@ -13,11 +13,9 @@ import (
 	"sort"
 	"strconv"
 	"strings"
-	"time"
 
 	gh "github.com/google/go-github/v84/github"
 
-	"github.com/vanducng/miu-cr/internal/cli/clierr"
 	"github.com/vanducng/miu-cr/internal/config"
 	"github.com/vanducng/miu-cr/internal/engine"
 	"github.com/vanducng/miu-cr/internal/engine/diff"
@@ -646,14 +644,13 @@ func resolveApproveEvent(ctx stdctx.Context, client Client, info *PRInfo, opts P
 		return "COMMENT", approveReasonAlreadyDone, false
 	}
 
-	// Re-fetch the head SHA right before deciding: the LLM pass can take long
-	// enough for a new push to land; an APPROVE on a stale head is unsafe.
-	headUnchanged := false
-	if fresh, err := client.GetPR(ctx, info.Owner, info.Repo, info.Number); err == nil && fresh != nil && fresh.GetHead() != nil {
-		headUnchanged = fresh.GetHead().GetSHA() == info.HeadSHA
+	event, reason = resolveEvent(opts, *info, opts.GateClean, findings, opts.ReviewedFiles, true)
+	if event != "APPROVE" {
+		return event, reason, approvalState.prior
 	}
-
-	event, reason = resolveEvent(opts, *info, opts.GateClean, findings, opts.ReviewedFiles, headUnchanged)
+	if reason = approvalReadiness(ctx, client, info); reason != approveReasonApproved {
+		return "COMMENT", reason, approvalState.prior
+	}
 	return event, reason, approvalState.prior
 }
 
@@ -857,7 +854,7 @@ func UpsertSummaryComment(ctx stdctx.Context, client Client, info *PRInfo, body 
 		return UpsertNone, "", nil
 	}
 
-	targetID, targetURL, err := findSummaryComment(ctx, client, info)
+	targetID, targetURL, _, err := findSummaryCommentBody(ctx, client, info)
 	if err != nil {
 		return UpsertNone, "", err
 	}
@@ -877,29 +874,43 @@ func UpsertSummaryComment(ctx stdctx.Context, client Client, info *PRInfo, body 
 	return createSummaryComment(ctx, client, info, body)
 }
 
-// CreateSummaryCommentIfMissing creates the initial placeholder without hiding an existing result.
-func CreateSummaryCommentIfMissing(ctx stdctx.Context, client Client, info *PRInfo, body string) (UpsertAction, string, error) {
-	if strings.TrimSpace(body) == "" {
+func UpsertSummaryStatus(ctx stdctx.Context, client Client, info *PRInfo, status, fallbackBody string) (UpsertAction, string, error) {
+	if strings.TrimSpace(status) == "" {
 		return UpsertNone, "", nil
 	}
-	targetID, targetURL, err := findSummaryComment(ctx, client, info)
+	targetID, targetURL, current, err := findSummaryCommentBody(ctx, client, info)
 	if err != nil {
 		return UpsertNone, "", err
 	}
-	if targetID != 0 {
+	if targetID == 0 {
+		return createSummaryComment(ctx, client, info, fallbackBody)
+	}
+	body := withSummaryStatus(current, status)
+	if body == current {
 		return UpsertNone, summaryCommentURL(info, targetID, targetURL), nil
 	}
-	return createSummaryComment(ctx, client, info, body)
+	edited, err := client.EditIssueComment(ctx, info.Owner, info.Repo, targetID, &gh.IssueComment{Body: gh.Ptr(body)})
+	if err != nil {
+		if is403(err) && inGitHubActions() {
+			return UpsertForkFallback, "", nil
+		}
+		return UpsertNone, "", mapWriteError("github.upsert_summary_failed", "editing summary status", err)
+	}
+	if edited.GetHTMLURL() != "" {
+		targetURL = edited.GetHTMLURL()
+	}
+	return UpsertEdited, summaryCommentURL(info, targetID, targetURL), nil
 }
 
-func findSummaryComment(ctx stdctx.Context, client Client, info *PRInfo) (int64, string, error) {
+func findSummaryCommentBody(ctx stdctx.Context, client Client, info *PRInfo) (int64, string, string, error) {
 	targetID := int64(0)
 	targetURL := ""
+	targetBody := ""
 	opts := &gh.IssueListCommentsOptions{ListOptions: gh.ListOptions{PerPage: 100}}
 	for page := 0; page < maxConvPages; page++ {
 		comments, resp, err := client.ListIssueComments(ctx, info.Owner, info.Repo, info.Number, opts)
 		if err != nil {
-			return 0, "", mapWriteError("github.upsert_summary_failed", "listing issue comments", err)
+			return 0, "", "", mapWriteError("github.upsert_summary_failed", "listing issue comments", err)
 		}
 		for _, c := range comments {
 			if !strings.Contains(c.GetBody(), ReviewMarker) {
@@ -908,6 +919,7 @@ func findSummaryComment(ctx stdctx.Context, client Client, info *PRInfo) (int64,
 			if id := c.GetID(); id > 0 && (targetID == 0 || id < targetID) {
 				targetID = id
 				targetURL = c.GetHTMLURL()
+				targetBody = c.GetBody()
 			}
 		}
 		if resp == nil || resp.NextPage == 0 {
@@ -915,7 +927,7 @@ func findSummaryComment(ctx stdctx.Context, client Client, info *PRInfo) (int64,
 		}
 		opts.Page = resp.NextPage
 	}
-	return targetID, targetURL, nil
+	return targetID, targetURL, targetBody, nil
 }
 
 func createSummaryComment(ctx stdctx.Context, client Client, info *PRInfo, body string) (UpsertAction, string, error) {
@@ -939,46 +951,8 @@ func summaryCommentURL(info *PRInfo, id int64, got string) string {
 	return fmt.Sprintf("%s/pull/%d#issuecomment-%d", strings.TrimRight(info.HTMLBase, "/"), info.Number, id)
 }
 
-// mapWriteError maps go-github rate-limit errors to a retryable github.rate_limited
-// CLIError (carrying Retry-After when known) and falls back to a generic typed error.
+// mapWriteError classifies a GitHub write-path failure with the same ghAPIError
+// rules as FetchPR (rate-limit / 5xx / net / unexpected EOF).
 func mapWriteError(code, stage string, err error) error {
-	var rle *gh.RateLimitError
-	var arle *gh.AbuseRateLimitError
-	if errors.As(err, &rle) {
-		ce := &clierr.CLIError{
-			Code:      "github.rate_limited",
-			Message:   "GitHub rate limit exceeded",
-			Hint:      "wait for the rate limit to reset, then re-run",
-			Exit:      1,
-			Retry:     true,
-			SafeRetry: true,
-		}
-		if !rle.Rate.Reset.IsZero() {
-			ce.Details = map[string]any{"retry_after_seconds": int(time.Until(rle.Rate.Reset.Time).Seconds())}
-		}
-		return ce
-	}
-	if errors.As(err, &arle) {
-		ce := &clierr.CLIError{
-			Code:      "github.rate_limited",
-			Message:   "GitHub secondary (abuse) rate limit exceeded",
-			Hint:      "wait before retrying",
-			Exit:      1,
-			Retry:     true,
-			SafeRetry: true,
-		}
-		if arle.RetryAfter != nil {
-			ce.Details = map[string]any{"retry_after_seconds": int(arle.RetryAfter.Seconds())}
-		}
-		return ce
-	}
-	return ghWriteError(code, stage, err)
-}
-
-func ghWriteError(code, stage string, err error) error {
-	return &clierr.CLIError{
-		Code:    code,
-		Message: config.RedactString(fmt.Sprintf("%s: %v", stage, err)),
-		Exit:    1,
-	}
+	return ghAPIError(code, stage, err)
 }

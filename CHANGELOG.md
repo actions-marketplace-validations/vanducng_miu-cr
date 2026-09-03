@@ -55,6 +55,105 @@ comment with a new marker); subsequent re-runs dedupe normally. On a
 first M5 review **manually** (or off-hours) to absorb the one-time re-post before
 the next scheduled run.
 
+## [0.89.9](https://github.com/vanducng/miu-cr/compare/v0.89.8...v0.89.9) (2026-08-24)
+
+
+### Bug Fixes
+
+* **github:** retry unexpected EOF when listing PR comments ([024ab35](https://github.com/vanducng/miu-cr/commit/024ab3597841435756f9afb01ec4a073ed1bf355)), closes [#303](https://github.com/vanducng/miu-cr/issues/303)
+
+## [0.89.8](https://github.com/vanducng/miu-cr/compare/v0.89.7...v0.89.8) (2026-07-29)
+
+
+### Bug Fixes
+
+* **docs:** keep header search clickable ([#298](https://github.com/vanducng/miu-cr/issues/298)) ([9b5a415](https://github.com/vanducng/miu-cr/commit/9b5a41549d5af61a2f169d84cc5ae9ccdf20bf7e))
+
+## [0.89.7](https://github.com/vanducng/miu-cr/compare/v0.89.6...v0.89.7) (2026-07-29)
+
+
+### Bug Fixes
+
+* **docs:** scope search trigger sizing ([#296](https://github.com/vanducng/miu-cr/issues/296)) ([3d50366](https://github.com/vanducng/miu-cr/commit/3d50366e18e2e06052386b7a5157ee1a3da82ad9))
+
+## [0.89.6](https://github.com/vanducng/miu-cr/compare/v0.89.5...v0.89.6) (2026-07-29)
+
+
+### Bug Fixes
+
+* **docs:** restore shell spacing ([#294](https://github.com/vanducng/miu-cr/issues/294)) ([01b8108](https://github.com/vanducng/miu-cr/commit/01b810898a3f74599fa19dc2234e9aca80d61259))
+
+## [0.89.5](https://github.com/vanducng/miu-cr/compare/v0.89.4...v0.89.5) (2026-07-29)
+
+
+### Bug Fixes
+
+* **docs:** center navigation shell ([#292](https://github.com/vanducng/miu-cr/issues/292)) ([6a439e6](https://github.com/vanducng/miu-cr/commit/6a439e68271931a60c6a2ec98f0625833126a32a))
+
+## [0.89.4](https://github.com/vanducng/miu-cr/compare/v0.89.3...v0.89.4) (2026-07-29)
+
+
+### Bug Fixes
+
+* **docs:** restore Starlight layout ([#290](https://github.com/vanducng/miu-cr/issues/290)) ([63c10c9](https://github.com/vanducng/miu-cr/commit/63c10c96549f248edec6bce200f7ae213eb37050))
+
+## [0.89.3](https://github.com/vanducng/miu-cr/compare/v0.89.2...v0.89.3) (2026-07-21)
+
+
+### Bug Fixes
+
+* **github:** gate approvals on PR readiness ([#288](https://github.com/vanducng/miu-cr/issues/288)) ([a2d2fa7](https://github.com/vanducng/miu-cr/commit/a2d2fa72ecd9d73784a8bdc4cdd1910e4447bfec))
+
+## [0.89.2](https://github.com/vanducng/miu-cr/compare/v0.89.1...v0.89.2) (2026-07-20)
+
+
+### Bug Fixes
+
+* review deleted files before approval ([c257b0a](https://github.com/vanducng/miu-cr/commit/c257b0ac42ae78f00a8fa399415d22f9ca369506))
+
+## [0.89.1](https://github.com/vanducng/miu-cr/compare/v0.89.0...v0.89.1) (2026-07-19)
+
+
+### Bug Fixes
+
+* **github:** approved resolved reviews at published head ([#284](https://github.com/vanducng/miu-cr/issues/284)) ([c757055](https://github.com/vanducng/miu-cr/commit/c757055ddec10e0852b7b8157c0fa70bacc2e5e6))
+
+## [0.89.0](https://github.com/vanducng/miu-cr/compare/v0.88.0...v0.89.0) (2026-07-16)
+
+
+### Features
+
+* **engine:** inline whole small files and caller sites to cut review turns ([#282](https://github.com/vanducng/miu-cr/issues/282)) ([0234b96](https://github.com/vanducng/miu-cr/commit/0234b96aa6029fdda5cb4c84c2f5f5f11e28eafb))
+
+## [0.88.0](https://github.com/vanducng/miu-cr/compare/v0.87.0...v0.88.0) (2026-07-16)
+
+
+### Features
+
+* **engine:** prefetch referenced definitions via a per-review symbol index ([#278](https://github.com/vanducng/miu-cr/issues/278)) ([d62d603](https://github.com/vanducng/miu-cr/commit/d62d60338fb32efc09ca6785acdd106caf8fe405))
+
+## [0.87.0](https://github.com/vanducng/miu-cr/compare/v0.86.0...v0.87.0) (2026-07-16)
+
+
+### Features
+
+* **host:** per-repo anchor_recovery override in host YAML ([#279](https://github.com/vanducng/miu-cr/issues/279)) ([54cd7f7](https://github.com/vanducng/miu-cr/commit/54cd7f75caca5cd2e9481bf47ecadcd811dd8bbc))
+
+## [0.86.0](https://github.com/vanducng/miu-cr/compare/v0.85.3...v0.86.0) (2026-07-16)
+
+
+### Features
+
+* **review:** recover lost findings and cut wasted review turns ([#276](https://github.com/vanducng/miu-cr/issues/276)) ([a271090](https://github.com/vanducng/miu-cr/commit/a271090605e13f14c79804f0907579fe7431a4b2))
+* **rules:** add precision suppressions to default rule docs ([#275](https://github.com/vanducng/miu-cr/issues/275)) ([4c6f516](https://github.com/vanducng/miu-cr/commit/4c6f516af4e181adedb05128ca845942780dfc27))
+
+## [0.85.3](https://github.com/vanducng/miu-cr/compare/v0.85.2...v0.85.3) (2026-07-12)
+
+
+### Bug Fixes
+
+* **github:** surfaced queued review status ([#273](https://github.com/vanducng/miu-cr/issues/273)) ([b9ce173](https://github.com/vanducng/miu-cr/commit/b9ce173b7d212227e4c4f979cfc25c5e3fae5bcc))
+
 ## [0.85.2](https://github.com/vanducng/miu-cr/compare/v0.85.1...v0.85.2) (2026-07-04)
 
 

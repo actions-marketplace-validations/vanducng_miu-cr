@@ -26,6 +26,7 @@ func init() {
 type fakeAgent struct {
 	findings       []engine.Finding
 	gotRev         string
+	gotText        string
 	gotRules       string
 	gotSemantic    string
 	gotProject     string
@@ -40,11 +41,18 @@ type fakeAgent struct {
 	repair      func(engine.RepairRequest) (string, error)
 	repairUsage engine.Usage // returned per RepairPatch call (patch-repair metering tests)
 	repairCalls []engine.RepairRequest
+
+	// relocate drives RelocateQuote; nil => default "" (no usable quote). It
+	// records every call so tests can assert call count / order / skip.
+	relocate      func(engine.RelocateRequest) (string, error)
+	relocateUsage engine.Usage // returned per RelocateQuote call (anchor-recovery metering tests)
+	relocateCalls []engine.RelocateRequest
 }
 
 func (f *fakeAgent) Review(_ stdctx.Context, rc engine.AgentContext) (engine.ReviewOutput, error) {
 	f.reviewCalls++
 	f.gotRev = rc.Rev
+	f.gotText = rc.Text
 	f.gotRules = rc.Rules
 	f.gotSemantic = rc.SemanticContext
 	f.gotProject = rc.ProjectContext
@@ -77,6 +85,15 @@ func (f *fakeAgent) RepairPatch(_ stdctx.Context, rr engine.RepairRequest) (stri
 		return s, f.repairUsage, err
 	}
 	return "", f.repairUsage, nil
+}
+
+func (f *fakeAgent) RelocateQuote(_ stdctx.Context, rr engine.RelocateRequest) (string, engine.Usage, error) {
+	f.relocateCalls = append(f.relocateCalls, rr)
+	if f.relocate != nil {
+		s, err := f.relocate(rr)
+		return s, f.relocateUsage, err
+	}
+	return "", f.relocateUsage, nil
 }
 
 // fakeRetriever drives the engine's semantic seam without embed/DB/network.
@@ -162,6 +179,30 @@ func TestReviewPipelineEndToEnd(t *testing.T) {
 	}
 	if engine.GateFailed(res.Findings, "high") != true {
 		t.Error("high finding must trip high gate")
+	}
+}
+
+func TestReviewPipelineReviewsDeletedFiles(t *testing.T) {
+	dir := initRepo(t)
+	writeFile(t, dir, "removed.go", "package removed\n\nfunc Used() bool { return false }\n")
+	git(t, dir, "add", ".")
+	git(t, dir, "commit", "-q", "-m", "base")
+	git(t, dir, "rm", "-q", "removed.go")
+
+	fa := &fakeAgent{}
+	eng := engine.New(fa, gitcmd.New())
+	res, err := eng.Review(stdctx.Background(), engine.Request{Mode: 0, RepoDir: dir, Gate: "high", Extensions: []string{"go"}})
+	if err != nil {
+		t.Fatalf("Review: %v", err)
+	}
+	if fa.reviewCalls != 1 {
+		t.Fatalf("deleted file must reach the reviewer, got %d review calls", fa.reviewCalls)
+	}
+	if !strings.Contains(fa.gotText, `path="removed.go"`) || !strings.Contains(fa.gotText, "-func Used() bool { return false }") {
+		t.Fatalf("deleted file must use its original path and include removed code:\n%s", fa.gotText)
+	}
+	if got := res.Stats["files_reviewed"]; got != float64(1) {
+		t.Fatalf("files_reviewed: want 1, got %v", got)
 	}
 }
 
@@ -277,6 +318,35 @@ func TestReviewInjectsChangedSymbolContext(t *testing.T) {
 	}
 	if got, _ := res.Stats["changed_symbol_context_files"].(float64); got != 1 {
 		t.Fatalf("changed_symbol_context_files: got %v", res.Stats["changed_symbol_context_files"])
+	}
+}
+
+// A changed file calling a symbol defined in an UNCHANGED file must get that
+// definition prefetched into the prompt context, after the changed-symbol block.
+func TestReviewInjectsReferencedDefsContext(t *testing.T) {
+	dir := initRepo(t)
+	writeFile(t, dir, "util.go", "package app\n\nfunc HelperThing() int { return 1 }\n")
+	writeFile(t, dir, "app.go", "package app\n\nfunc Existing() int { return 1 }\n")
+	git(t, dir, "add", ".")
+	git(t, dir, "commit", "-q", "-m", "base")
+	writeFile(t, dir, "app.go", "package app\n\nfunc Existing() int { return 1 }\n\nfunc Risky() int { return HelperThing() }\n")
+	git(t, dir, "add", "app.go")
+
+	fa := &fakeAgent{}
+	eng := engine.New(fa, gitcmd.New())
+	_, err := eng.Review(stdctx.Background(), engine.Request{Mode: 0, RepoDir: dir, Gate: "high", Extensions: []string{"go"}})
+	if err != nil {
+		t.Fatalf("Review: %v", err)
+	}
+	refHeader := "Definitions referenced by this change"
+	if !strings.Contains(fa.gotRelated, refHeader) {
+		t.Fatalf("referenced-defs block missing from RelatedContext: %q", fa.gotRelated)
+	}
+	if !strings.Contains(fa.gotRelated, "HelperThing (function) util.go:3") {
+		t.Fatalf("referenced-defs block did not resolve HelperThing: %q", fa.gotRelated)
+	}
+	if strings.Index(fa.gotRelated, "Changed symbol context from the reviewed revision") > strings.Index(fa.gotRelated, refHeader) {
+		t.Fatalf("referenced-defs block must follow the changed-symbol block: %q", fa.gotRelated)
 	}
 }
 
@@ -584,5 +654,35 @@ func TestReviewEmptyStaged(t *testing.T) {
 	}
 	if engine.GateFailed(res.Findings, "high") {
 		t.Error("empty staged must not fail the gate")
+	}
+}
+
+// An UNCHANGED file calling a symbol defined in a changed file must get that
+// call site prefetched into the prompt context, after the referenced-defs block.
+func TestReviewInjectsCallerContext(t *testing.T) {
+	dir := initRepo(t)
+	writeFile(t, dir, "app.go", "package app\n\nfunc Target() int { return 1 }\n")
+	writeFile(t, dir, "consumer.go", "package app\n\nfunc Uses() int { return Target() }\n")
+	git(t, dir, "add", ".")
+	git(t, dir, "commit", "-q", "-m", "base")
+	writeFile(t, dir, "app.go", "package app\n\nfunc Target() int { return 2 }\n")
+	git(t, dir, "add", "app.go")
+
+	fa := &fakeAgent{}
+	eng := engine.New(fa, gitcmd.New())
+	_, err := eng.Review(stdctx.Background(), engine.Request{Mode: 0, RepoDir: dir, Gate: "high", Extensions: []string{"go"}})
+	if err != nil {
+		t.Fatalf("Review: %v", err)
+	}
+	callHeader := "Call sites of symbols changed here"
+	if !strings.Contains(fa.gotRelated, callHeader) {
+		t.Fatalf("caller block missing from RelatedContext: %q", fa.gotRelated)
+	}
+	if !strings.Contains(fa.gotRelated, "Target ← consumer.go:3") {
+		t.Fatalf("caller block did not list the unchanged-file call site: %q", fa.gotRelated)
+	}
+	refHeader := "Definitions referenced by this change"
+	if ri, ci := strings.Index(fa.gotRelated, refHeader), strings.Index(fa.gotRelated, callHeader); ri >= 0 && ri > ci {
+		t.Fatalf("caller block must follow the referenced-defs block: %q", fa.gotRelated)
 	}
 }

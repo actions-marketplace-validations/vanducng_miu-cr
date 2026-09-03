@@ -9,9 +9,13 @@ import (
 	"encoding/hex"
 	"encoding/json"
 	"fmt"
+	"math"
 	"path/filepath"
+	"regexp"
 	"sort"
+	"strconv"
 	"strings"
+	"sync"
 	"time"
 	"unicode/utf8"
 
@@ -111,9 +115,22 @@ type ReviewTrace struct {
 	// Reasoning holds the model's captured internal reasoning. Populated only when
 	// CaptureReasoning is on AND [review].thinking is enabled (off = nothing to capture).
 	// Quotes diff content: always redacted at persist; opt-in, off by default.
-	Reasoning    *TraceReasoning                `json:"reasoning,omitempty"`
-	Sink         func(step string, payload any) `json:"-"`
-	modelEmitted bool                           // the live "model" step fires once, when model first becomes non-empty
+	Reasoning *TraceReasoning `json:"reasoning,omitempty"`
+	// AnchorRecoveries holds one record per anchor-recovery attempt (which finding,
+	// whether its relocated quote re-anchored). Identity only, no code quotes.
+	AnchorRecoveries []AnchorRecoveryRecord         `json:"anchor_recoveries,omitempty"`
+	Sink             func(step string, payload any) `json:"-"`
+	modelEmitted     bool                           // the live "model" step fires once, when model first becomes non-empty
+}
+
+// AnchorRecoveryRecord is one anchor-recovery attempt: the finding's identity
+// (file + severity) and the outcome (Recovered + the re-anchored line, 0 when
+// the relocated quote still failed to anchor).
+type AnchorRecoveryRecord struct {
+	File      string `json:"file"`
+	Severity  string `json:"severity"`
+	Recovered bool   `json:"recovered"`
+	Line      int    `json:"line,omitempty"`
 }
 
 // TraceReasoning holds one captured reasoning output. Text is the raw thinking for
@@ -275,6 +292,15 @@ func (t *ReviewTrace) RecordTurnReason(turn int, text string) {
 	t.emit("turn_reason", tr)
 }
 
+// RecordAnchorRecovery appends one anchor-recovery attempt/outcome; nil-safe.
+func (t *ReviewTrace) RecordAnchorRecovery(rec AnchorRecoveryRecord) {
+	if t == nil {
+		return
+	}
+	t.AnchorRecoveries = append(t.AnchorRecoveries, rec)
+	t.emit("anchor_recovery", rec)
+}
+
 // SetReasoning captures the model's reasoning once (first non-empty wins); nil-safe.
 // Only call when text is non-empty: reasoning quotes diff content and is redacted at persist.
 func (t *ReviewTrace) SetReasoning(provider, text string, tokens int64) {
@@ -348,10 +374,15 @@ type AgentContext struct {
 	ProviderRetry  config.ProviderRetry
 	Tools          config.ReviewTools
 	SymbolContext  config.SymbolContext
-	RepoDir        string
-	Rev            string
-	Runner         *gitcmd.Runner
-	Progress       func(string) // nil = silent; milestone strings only, never secrets
+	// Index is the per-review symbol index shared by every symbol_context call
+	// in the pass (and across subagents). LOCKSTEP: mirror Rules — thread it
+	// here -> agent.Context -> toolContext in the agent package, and forward it
+	// in the wire adapter, or every tool call rebuilds the repo scan.
+	Index    *symbolcontext.Index
+	RepoDir  string
+	Rev      string
+	Runner   *gitcmd.Runner
+	Progress func(string) // nil = silent; milestone strings only, never secrets
 	// Trace, when non-nil, captures the raw prompt, per-turn tool calls/results, and raw
 	// final response for persistence. nil = no capture (mirrors Progress).
 	Trace *ReviewTrace
@@ -398,6 +429,13 @@ type Agent interface {
 	// token Usage. "" => no usable replacement; the engine falls back to the
 	// original finding. The wire layer adapts this to agent.RepairPatch.
 	RepairPatch(ctx stdctx.Context, rr RepairRequest) (string, Usage, error)
+	// RelocateQuote runs the anchor-recovery second pass: ONE drift-rejected
+	// finding + its file excerpt in, the exact verbatim line(s) it refers to out
+	// (already fence-stripped/trimmed) plus that call's token Usage. The engine
+	// re-anchors the reply with the SAME deterministic anchorer; "" => no usable
+	// quote (the finding stays dropped). The wire layer adapts this to
+	// agent.RelocateQuote.
+	RelocateQuote(ctx stdctx.Context, rr RelocateRequest) (string, Usage, error)
 }
 
 // RepairRequest is the engine-side shadow of agent.RepairRequest (defined here so
@@ -405,6 +443,20 @@ type Agent interface {
 type RepairRequest struct {
 	Span          string
 	Rationale     string
+	Category      string
+	Severity      string
+	ProviderRetry config.ProviderRetry
+}
+
+// RelocateRequest is the engine-side shadow of agent.RelocateRequest (mirrors
+// RepairRequest; the wire layer adapts it). QuotedCode is the anchor quote that
+// FAILED to match; Excerpt is that file's diff (or new-file content) the model
+// must copy the true line(s) from.
+type RelocateRequest struct {
+	File          string
+	Rationale     string
+	QuotedCode    string
+	Excerpt       string
 	Category      string
 	Severity      string
 	ProviderRetry config.ProviderRetry
@@ -494,6 +546,15 @@ type Request struct {
 	// (0 => defaultMaxRepair); candidates are tried highest-severity-first.
 	PatchRepair bool
 	MaxRepair   int
+
+	// AnchorRecovery opts into the bounded second LLM pass that rescues findings
+	// whose QuotedCode failed line-anchoring (drift-reject would drop them): one
+	// focused RelocateQuote call per finding (severity >= medium, highest first,
+	// hard cap maxAnchorRecovery), and the recovered quote is kept ONLY if the
+	// SAME deterministic anchorer now places it. Runs on both the local and PR
+	// paths. Resolved from [review].anchor_recovery (default on) by the wire
+	// layer. OFF is byte-identical: no calls, no stats.
+	AnchorRecovery bool
 
 	// Persist context copied onto the saved PersistRecord (no secrets): the resolved
 	// provider/model and, on the --pr path, the PR owner/repo/number. Local reviews
@@ -671,10 +732,16 @@ func (e *Engine) Review(ctx stdctx.Context, req Request) (ReviewResult, error) {
 		related = enginectx.BuildRelatedContext(ctx, req.RepoDir, rev, selected, e.Runner, enginectx.RelatedOptions{HopDepth: relatedHops})
 		relatedMS = time.Since(relatedStart).Milliseconds()
 	}
+	// One symbol index for the whole review: the prompt prefetches below and
+	// every symbol_context tool call (across all backends and subagents) share
+	// its single lazy repo scan instead of rebuilding ls-files + git-show xN.
+	symbolIndex := symbolcontext.NewIndex(req.SymbolContext, symbolcontext.Context{RepoDir: req.RepoDir, Rev: rev, Runner: e.Runner})
 	changedSymbolStart := time.Now()
-	changedSymbolContext, changedSymbolFiles, changedSymbolTruncated := buildChangedSymbolContext(ctx, req, selected, rev, e.Runner)
+	changedSymbolContext, changedSymbolFiles, changedSymbolTruncated := buildChangedSymbolContext(ctx, req, selected, rev, e.Runner, symbolIndex)
 	changedSymbolMS := time.Since(changedSymbolStart).Milliseconds()
-	relatedText := joinPromptContext(changedSymbolContext, related.Text)
+	referencedDefsContext := buildReferencedDefsContext(ctx, selected, symbolIndex)
+	callerContext := buildCallerContext(ctx, req.RepoDir, selected, rev, e.Runner, symbolIndex)
+	relatedText := joinPromptContext(changedSymbolContext, referencedDefsContext, callerContext, related.Text)
 
 	trace.SetModel(req.Provider, req.Model)
 
@@ -684,6 +751,7 @@ func (e *Engine) Review(ctx stdctx.Context, req Request) (ReviewResult, error) {
 		projectContext:  projectContext,
 		relatedContext:  relatedText,
 		rev:             rev,
+		index:           symbolIndex,
 		trace:           trace,
 	})
 	if err != nil {
@@ -694,6 +762,9 @@ func (e *Engine) Review(ctx stdctx.Context, req Request) (ReviewResult, error) {
 		return ReviewResult{}, &clierr.CLIError{Code: "engine.no_anchorer", Message: "anchoring not wired", Exit: 1}
 	}
 	anchored := anchorLineNumbers(out.Findings, selected)
+	recoveryStart := time.Now()
+	anchored, recovery := e.recoverAnchors(ctx, anchored, selected, req, trace)
+	recoveryMS := time.Since(recoveryStart).Milliseconds()
 	kept := dropDrift(anchored)
 	kept = dedupe(kept)
 
@@ -735,6 +806,24 @@ func (e *Engine) Review(ctx stdctx.Context, req Request) (ReviewResult, error) {
 	for k, v := range passStats {
 		stats[k] = v
 	}
+	// findings_dropped above already counts only the FINALLY-dropped findings:
+	// recovery re-anchored its successes in place before dropDrift ran.
+	if recovery.attempted > 0 {
+		stats["anchor_recovery"] = map[string]any{
+			"attempted":             float64(recovery.attempted),
+			"recovered":             float64(recovery.recovered),
+			"skipped_cap":           float64(recovery.skippedCap),
+			"input_tokens":          float64(recovery.usage.InputTokens),
+			"output_tokens":         float64(recovery.usage.OutputTokens),
+			"cache_read_tokens":     float64(recovery.usage.CacheReadTokens),
+			"cache_creation_tokens": float64(recovery.usage.CacheCreationTokens),
+			"ms":                    float64(recoveryMS),
+		}
+	}
+	if recovery.recovered > 0 {
+		stats["findings_recovered"] = float64(recovery.recovered)
+	}
+	out.Usage.Add(recovery.usage) // fold the anchor-recovery second-pass tokens into metering + stats
 	repairStart := time.Now()
 	kept, repairUsage := e.repairPatches(ctx, kept, selected, req, stats)
 	out.Usage.Add(repairUsage) // fold the --patch-repair second-pass tokens into metering + stats
@@ -900,10 +989,29 @@ func retrieveSemantic(ctx stdctx.Context, r Retriever, selected []diff.Diff) (ad
 const (
 	projectContextMaxFileBytes  = 8 * 1024
 	projectContextMaxTotalBytes = 32 * 1024
-	changedSymbolContextFiles   = 12
-	changedSymbolContextBytes   = 16 * 1024
-	changedSymbolContextLimit   = 8
-	changedSymbolContextHeader  = "Changed symbol context from the reviewed revision:\n"
+	// Sized from production traces: the 16KB/12-file cap truncated 31% of
+	// reviews, and truncated reviews spend extra tool turns re-fetching what the
+	// prefetch dropped. Build cost is ~19ms, so the larger cap is near-free.
+	changedSymbolContextFiles  = 20
+	changedSymbolContextBytes  = 32 * 1024
+	changedSymbolContextLimit  = 8
+	changedSymbolContextHeader = "Changed symbol context from the reviewed revision:\n"
+	// Production traces: half of the model's symbol_context definition calls look
+	// up symbols the diff uses but does not define, each on a ~27s sequential
+	// provider turn. Prefetching their definitions into the prompt removes those
+	// turns entirely.
+	referencedDefsMaxNames   = 10
+	referencedDefsMaxPerName = 3
+	referencedDefsBytes      = 8 * 1024
+	referencedDefsHeader     = "Definitions referenced by this change (already resolved; do not re-fetch these with symbol_context):\n"
+	// Production traces: grep (357 calls across 40 traces) is dominated by
+	// impact-analysis lookups of who calls the changed code. Prefetching those
+	// call sites removes the sequential grep turns.
+	callerContextMaxSymbols = 8
+	callerContextMaxSites   = 4
+	callerContextMaxGreps   = 4 // concurrent git-grep subprocesses during assembly
+	callerContextBytes      = 8 * 1024
+	callerContextHeader     = "Call sites of symbols changed here (impact context, already fetched; grep only for symbols not listed):\n"
 )
 
 var projectContextFiles = []string{"AGENTS.md", "CLAUDE.md"}
@@ -951,7 +1059,7 @@ func (e *Engine) loadProjectContext(ctx stdctx.Context, repoDir, rev string) (st
 	return sb.String(), files, truncated
 }
 
-func buildChangedSymbolContext(ctx stdctx.Context, req Request, selected []diff.Diff, rev string, runner *gitcmd.Runner) (string, int, bool) {
+func buildChangedSymbolContext(ctx stdctx.Context, req Request, selected []diff.Diff, rev string, runner *gitcmd.Runner, index *symbolcontext.Index) (string, int, bool) {
 	if runner == nil {
 		runner = gitcmd.New()
 	}
@@ -966,7 +1074,7 @@ func buildChangedSymbolContext(ctx stdctx.Context, req Request, selected []diff.
 	if maxBytes > changedSymbolContextBytes {
 		maxBytes = changedSymbolContextBytes
 	}
-	tc := symbolcontext.Context{RepoDir: req.RepoDir, Rev: rev, Runner: runner}
+	tc := symbolcontext.Context{RepoDir: req.RepoDir, Rev: rev, Runner: runner, Index: index}
 	var sb strings.Builder
 	seen := map[string]bool{}
 	files := 0
@@ -1004,6 +1112,11 @@ func buildChangedSymbolContext(ctx stdctx.Context, req Request, selected []diff.
 		}
 		sb.WriteString(block)
 		files++
+	}
+	// Traces show ~27% of the model's document_symbols calls re-request files
+	// already injected above; say so explicitly to stop the duplicate turns.
+	if sb.Len() > 0 {
+		sb.WriteString("\n(document_symbols for the files above are already included here; call symbol_context on them only for a relation not shown.)\n")
 	}
 	return strings.TrimRight(sb.String(), "\n"), files, truncated
 }
@@ -1052,6 +1165,357 @@ func usefulSymbolOutput(out string, failed bool) bool {
 		}
 	}
 	return true
+}
+
+// referencedDefsIdentRe tokenizes candidate identifiers from added lines:
+// word-shaped, at least 3 chars.
+var referencedDefsIdentRe = regexp.MustCompile(`[A-Za-z_][A-Za-z0-9_]{2,}`)
+
+// referencedDefsSkipWords holds language keywords and literals (go/py/ts/js/sql
+// common set) that ride added lines but never name a project definition.
+var referencedDefsSkipWords = map[string]bool{
+	"abstract": true, "alter": true, "and": true, "any": true, "as": true, "asc": true,
+	"assert": true, "async": true, "await": true, "begin": true, "between": true,
+	"boolean": true, "break": true, "case": true, "catch": true, "chan": true,
+	"class": true, "column": true, "commit": true, "const": true, "constructor": true,
+	"continue": true, "create": true, "cross": true, "debugger": true, "declare": true,
+	"def": true, "default": true, "defer": true, "del": true, "delete": true,
+	"desc": true, "distinct": true, "do": true, "drop": true, "elif": true,
+	"else": true, "end": true, "enum": true, "except": true, "exists": true,
+	"export": true, "extends": true, "fallthrough": true, "false": true, "finally": true,
+	"for": true, "foreign": true, "from": true, "full": true, "func": true,
+	"function": true, "global": true, "go": true, "goto": true, "group": true,
+	"having": true, "if": true, "implements": true, "import": true, "in": true,
+	"index": true, "inner": true, "insert": true, "instanceof": true, "interface": true,
+	"into": true, "is": true, "join": true, "lambda": true, "left": true,
+	"let": true, "like": true, "limit": true, "map": true, "new": true,
+	"nil": true, "none": true, "nonlocal": true, "not": true, "null": true,
+	"number": true, "of": true, "offset": true, "or": true, "order": true,
+	"outer": true, "package": true, "pass": true, "primary": true, "private": true,
+	"protected": true, "public": true, "raise": true, "range": true, "readonly": true,
+	"references": true, "replace": true, "return": true, "right": true, "rollback": true,
+	"select": true, "self": true, "static": true, "string": true, "struct": true,
+	"super": true, "switch": true, "table": true, "then": true, "this": true,
+	"throw": true, "try": true, "type": true, "typeof": true, "undefined": true,
+	"union": true, "update": true, "values": true, "var": true, "view": true,
+	"void": true, "when": true, "where": true, "while": true, "with": true,
+	"yield": true,
+	// builtin/primitive type + function names: frequent on added lines, never
+	// project definitions worth a ranking slot.
+	"bool": true, "byte": true, "bytes": true, "complex64": true, "complex128": true,
+	"dict": true, "error": true, "float": true, "float32": true, "float64": true,
+	"int8": true, "int16": true, "int32": true, "int64": true, "isinstance": true,
+	"len": true, "list": true, "make": true, "object": true, "print": true,
+	"rune": true, "set": true, "str": true, "tuple": true, "uint": true,
+	"uint8": true, "uint16": true, "uint32": true, "uint64": true, "uintptr": true,
+}
+
+// buildReferencedDefsContext prefetches definitions for the symbols the change
+// USES but does not define: identifiers on added lines, minus keywords/literals
+// and anything defined in the changed files (the changed-symbol block already
+// covers those), ranked deterministically and resolved via the shared index.
+// Empty result => byte-identical prompt.
+func buildReferencedDefsContext(ctx stdctx.Context, selected []diff.Diff, index *symbolcontext.Index) string {
+	if index == nil {
+		return ""
+	}
+	counts := map[string]int{}
+	for _, d := range selected {
+		for _, h := range diff.ParseHunks(d.Diff) {
+			for _, l := range h.Lines {
+				if l.Type != diff.HunkAdded {
+					continue
+				}
+				for _, tok := range referencedDefsIdentRe.FindAllString(l.Content, -1) {
+					if skipReferencedIdentifier(tok) {
+						continue
+					}
+					counts[tok]++
+				}
+			}
+		}
+	}
+	if len(counts) == 0 {
+		return ""
+	}
+	changedDefs := changedFileDefNames(ctx, selected, index)
+	names := make([]string, 0, len(counts))
+	for name := range counts {
+		if changedDefs[strings.ToLower(name)] {
+			continue
+		}
+		names = append(names, name)
+	}
+	sort.Slice(names, func(i, j int) bool {
+		if counts[names[i]] != counts[names[j]] {
+			return counts[names[i]] > counts[names[j]]
+		}
+		if len(names[i]) != len(names[j]) {
+			return len(names[i]) > len(names[j])
+		}
+		return names[i] < names[j]
+	})
+	if len(names) > referencedDefsMaxNames {
+		names = names[:referencedDefsMaxNames]
+	}
+	var sb strings.Builder
+	for _, name := range names {
+		defs := index.Lookup(ctx, name)
+		if len(defs) == 0 {
+			continue
+		}
+		if len(defs) > referencedDefsMaxPerName {
+			defs = defs[:referencedDefsMaxPerName]
+		}
+		for _, d := range defs {
+			fmt.Fprintf(&sb, "- %s (%s) %s:%d — %s\n", d.Name, d.Kind, d.File, d.Line, d.Signature)
+		}
+	}
+	if sb.Len() == 0 {
+		return ""
+	}
+	out := string(truncateUTF8Bytes([]byte(referencedDefsHeader+sb.String()), referencedDefsBytes))
+	// Drop a truncation-split partial line: a half signature is misleading context.
+	if !strings.HasSuffix(out, "\n") {
+		if i := strings.LastIndexByte(out, '\n'); i >= len(referencedDefsHeader) {
+			out = out[:i]
+		}
+	}
+	return strings.TrimRight(out, "\n")
+}
+
+// skipReferencedIdentifier drops keywords/literals and short all-lowercase
+// words (<4 chars) that are almost never project symbols worth prefetching.
+func skipReferencedIdentifier(tok string) bool {
+	if len(tok) < 4 && tok == strings.ToLower(tok) {
+		return true
+	}
+	return referencedDefsSkipWords[strings.ToLower(tok)]
+}
+
+// changedFileDefNames collects the lowercased names (plus dot-suffixes,
+// mirroring symbolMatches) defined in the changed files themselves.
+func changedFileDefNames(ctx stdctx.Context, selected []diff.Diff, index *symbolcontext.Index) map[string]bool {
+	out := map[string]bool{}
+	for _, d := range selected {
+		if d.IsDeleted {
+			continue
+		}
+		path := filepath.ToSlash(strings.TrimSpace(d.NewPath))
+		if path == "" {
+			continue
+		}
+		defs, ok := index.FileDefinitions(ctx, path)
+		if !ok {
+			continue
+		}
+		for _, def := range defs {
+			name := strings.ToLower(def.Name)
+			out[name] = true
+			for {
+				i := strings.IndexByte(name, '.')
+				if i < 0 {
+					break
+				}
+				name = name[i+1:]
+				out[name] = true
+			}
+		}
+	}
+	return out
+}
+
+// buildCallerContext prefetches call sites of the symbols this change touches:
+// for each changed symbol (definition in a changed file whose span overlaps a
+// new-side hunk range) it greps the reviewed revision for call-shaped matches
+// outside the changed files. Empty result => byte-identical prompt.
+func buildCallerContext(ctx stdctx.Context, repoDir string, selected []diff.Diff, rev string, runner *gitcmd.Runner, index *symbolcontext.Index) string {
+	defs := changedSymbolDefs(ctx, selected, index)
+	if len(defs) == 0 {
+		return ""
+	}
+	changed := map[string]bool{}
+	for _, d := range selected {
+		if p := filepath.ToSlash(strings.TrimSpace(d.NewPath)); p != "" {
+			changed[p] = true
+		}
+	}
+	// Each grep is a git subprocess; run them concurrently (bounded) and render
+	// in def order so the output stays deterministic.
+	greps := make([]string, len(defs))
+	var wg sync.WaitGroup
+	sem := make(chan struct{}, callerContextMaxGreps)
+	for i, def := range defs {
+		wg.Add(1)
+		go func(i int, name string) {
+			defer wg.Done()
+			sem <- struct{}{}
+			defer func() { <-sem }()
+			if out, err := enginectx.Grep(ctx, repoDir, rev, name, runner); err == nil {
+				greps[i] = out
+			}
+		}(i, def.Name)
+	}
+	wg.Wait()
+
+	var sb strings.Builder
+	for i, def := range defs {
+		if greps[i] == "" {
+			continue
+		}
+		// Per-symbol exclusion on purpose: a def line of one changed symbol may
+		// legitimately CALL another changed symbol.
+		defLines := map[string]bool{}
+		for _, d := range index.Lookup(ctx, def.Name) {
+			defLines[fmt.Sprintf("%s:%d", d.File, d.Line)] = true
+		}
+		re := callSiteRe(def.Name)
+		sites := 0
+		for _, m := range parseGrepMatches(greps[i]) {
+			if sites >= callerContextMaxSites {
+				break
+			}
+			if changed[m.file] || defLines[fmt.Sprintf("%s:%d", m.file, m.line)] || !re.MatchString(m.content) {
+				continue
+			}
+			fmt.Fprintf(&sb, "- %s ← %s:%d: %s\n", def.Name, m.file, m.line, strings.TrimSpace(m.content))
+			sites++
+		}
+	}
+	if sb.Len() == 0 {
+		return ""
+	}
+	out := string(truncateUTF8Bytes([]byte(callerContextHeader+sb.String()), callerContextBytes))
+	// Drop a truncation-split partial line: a half call site is misleading context.
+	if !strings.HasSuffix(out, "\n") {
+		if i := strings.LastIndexByte(out, '\n'); i >= len(callerContextHeader) {
+			out = out[:i]
+		}
+	}
+	return strings.TrimRight(out, "\n")
+}
+
+// changedSymbolDefs lists the definitions in changed files whose enclosing span
+// (its Line up to the next definition's Line; the last runs to EOF) overlaps a
+// new-side hunk range. Deterministic: file path asc, then def line asc, one
+// entry per name, capped at callerContextMaxSymbols.
+func changedSymbolDefs(ctx stdctx.Context, selected []diff.Diff, index *symbolcontext.Index) []symbolcontext.Definition {
+	if index == nil {
+		return nil
+	}
+	byPath := map[string]string{}
+	var paths []string
+	for _, d := range selected {
+		if d.IsDeleted {
+			continue
+		}
+		path := filepath.ToSlash(strings.TrimSpace(d.NewPath))
+		if path == "" {
+			continue
+		}
+		if _, ok := byPath[path]; !ok {
+			paths = append(paths, path)
+		}
+		byPath[path] = d.Diff
+	}
+	sort.Strings(paths)
+	seen := map[string]bool{}
+	var out []symbolcontext.Definition
+	for _, path := range paths {
+		ranges := newSideHunkRanges(byPath[path])
+		if len(ranges) == 0 {
+			continue
+		}
+		defs, ok := index.FileDefinitions(ctx, path)
+		if !ok || len(defs) == 0 {
+			continue
+		}
+		sorted := make([]symbolcontext.Definition, len(defs))
+		copy(sorted, defs)
+		sort.Slice(sorted, func(i, j int) bool { return sorted[i].Line < sorted[j].Line })
+		for i, def := range sorted {
+			end := math.MaxInt
+			if i+1 < len(sorted) {
+				end = sorted[i+1].Line - 1
+				if end < def.Line {
+					end = def.Line
+				}
+			}
+			if seen[strings.ToLower(def.Name)] || !overlapsAny(ranges, def.Line, end) {
+				continue
+			}
+			seen[strings.ToLower(def.Name)] = true
+			out = append(out, def)
+			if len(out) >= callerContextMaxSymbols {
+				return out
+			}
+		}
+	}
+	return out
+}
+
+// newSideHunkRanges lists the new-side line spans the diff touches; a
+// pure-deletion hunk collapses to its single anchor line.
+func newSideHunkRanges(diffText string) [][2]int {
+	var out [][2]int
+	for _, h := range diff.ParseHunks(diffText) {
+		lo := h.NewStart
+		if lo < 1 {
+			lo = 1
+		}
+		hi := lo + h.NewCount - 1
+		if hi < lo {
+			hi = lo
+		}
+		out = append(out, [2]int{lo, hi})
+	}
+	return out
+}
+
+func overlapsAny(ranges [][2]int, lo, hi int) bool {
+	for _, r := range ranges {
+		if lo <= r[1] && hi >= r[0] {
+			return true
+		}
+	}
+	return false
+}
+
+// callSiteRe keeps only call-shaped matches: the name immediately followed by
+// "(" and not embedded in a longer identifier.
+func callSiteRe(name string) *regexp.Regexp {
+	return regexp.MustCompile(`(?:^|[^A-Za-z0-9_])` + regexp.QuoteMeta(name) + `\(`)
+}
+
+type grepMatch struct {
+	file    string
+	line    int
+	content string
+}
+
+// parseGrepMatches flattens enginectx.Grep's per-file "File: x / N|line" blocks.
+func parseGrepMatches(out string) []grepMatch {
+	var matches []grepMatch
+	file := ""
+	for _, ln := range strings.Split(out, "\n") {
+		if strings.HasPrefix(ln, "File: ") {
+			file = strings.TrimPrefix(ln, "File: ")
+			continue
+		}
+		if file == "" || ln == "" || strings.HasPrefix(ln, "Match lines: ") {
+			continue
+		}
+		i := strings.IndexByte(ln, '|')
+		if i <= 0 {
+			continue
+		}
+		num, err := strconv.Atoi(ln[:i])
+		if err != nil {
+			continue
+		}
+		matches = append(matches, grepMatch{file: file, line: num, content: ln[i+1:]})
+	}
+	return matches
 }
 
 func joinPromptContext(parts ...string) string {
@@ -1103,8 +1567,7 @@ func changedHunksOf(selected []diff.Diff) [][]string {
 	return out
 }
 
-// changedPathsOf derives forward-slash relative paths from the selected diffs
-// (NewPath, plus OldPath for renames) for glob matching.
+// changedPathsOf returns forward-slash review paths plus old rename paths for glob matching.
 func changedPathsOf(selected []diff.Diff) []string {
 	out := make([]string, 0, len(selected)*2) // worst case: a rename adds OldPath + NewPath
 	seen := map[string]bool{}
@@ -1117,7 +1580,7 @@ func changedPathsOf(selected []diff.Diff) []string {
 		out = append(out, p)
 	}
 	for _, d := range selected {
-		add(d.NewPath)
+		add(d.ReviewPath())
 		if d.IsRenamed {
 			add(d.OldPath)
 		}
@@ -1208,6 +1671,13 @@ func redactTrace(t ReviewTrace) ReviewTrace {
 		r := *t.Reasoning
 		r.Text = config.RedactString(r.Text)
 		t.Reasoning = &r
+	}
+	if len(t.AnchorRecoveries) > 0 {
+		recs := make([]AnchorRecoveryRecord, len(t.AnchorRecoveries))
+		for i, r := range t.AnchorRecoveries {
+			recs[i] = AnchorRecoveryRecord{File: config.RedactString(r.File), Severity: r.Severity, Recovered: r.Recovered, Line: r.Line}
+		}
+		t.AnchorRecoveries = recs
 	}
 	return t
 }
